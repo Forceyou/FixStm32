@@ -1,0 +1,10 @@
+﻿python : Usage: python -m platformio pkg install [OPTIONS]
+At line:15 char:2588
++ ... .pio_core"; python -m platformio pkg install -g toolchain-gccarmnonee ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (Usage: python -...stall [OPTIONS]:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+Try 'python -m platformio pkg install --help' for help.
+
+Error: Got unexpected extra argument (toolchain-gccarmnoneeabi)

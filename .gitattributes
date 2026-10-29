@@ -1,0 +1,1 @@
+.pio_core/.cache/downloads/* filter=lfs diff=lfs merge=lfs -text

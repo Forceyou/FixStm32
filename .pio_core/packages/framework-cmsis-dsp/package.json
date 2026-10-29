@@ -1,0 +1,16 @@
+{
+  "name": "framework-cmsis-dsp",
+  "version": "1.16.2",
+  "title": "CMSIS-DSP",
+  "description": "CMSIS-DSP is an optimized compute library for embedded systems",
+  "keywords": [
+    "framework",
+    "arm",
+    "dsp"
+  ],
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ARM-software/CMSIS-DSP"
+  }
+}

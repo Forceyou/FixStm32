@@ -1,0 +1,4 @@
+commit 7698174a9922c1d7002117ba9608e2aeee7dfdf2
+Author: Frederic Pillon <frederic.pillon@st.com>
+
+    chore: bump release version to 3.0.0
