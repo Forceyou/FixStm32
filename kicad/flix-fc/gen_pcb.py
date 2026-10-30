@@ -4,7 +4,7 @@ import re, uuid, os, sys, math, heapq
 
 BASE = r"c:\Users\admin\Desktop\flix-master\flix-stm32\kicad\flix-fc"
 SCH = os.path.join(BASE, "flix-fc.kicad_sch")
-PCB = os.path.join(BASE, "flix-fc.kicad_pcb")
+PCB = os.environ.get("PCB_OUT") or os.path.join(BASE, "flix-fc.kicad_pcb")
 LIB = r"C:\Program Files\KiCad\10.0\share\kicad\footprints"
 
 # placement: ref -> (x, y, rot)
@@ -187,10 +187,10 @@ NGRID      = 500
 BLOCK      = 255
 TRACK_W    = 0.2
 CLEAR      = 0.2
-PAD_MARGIN = CLEAR + TRACK_W / 2.0 + 0.05   # 0.35, rounded-rect expansion
-ROUTE_R    = 4
+PAD_MARGIN = CLEAR + TRACK_W / 2.0          # 0.30: 焊盘边缘到走线中心的最小合法距离
+ROUTE_R    = 3
 VIA_R      = 6
-VIA_COST   = 14.0
+VIA_COST   = 8.0
 VIA_DIA    = 0.5
 VIA_DRILL  = 0.3
 
@@ -435,6 +435,71 @@ gnd_id = NETIDX.get("GND", -1)
 # GND 由双面铺铜连接（布线后用 --refill-zones 填充），不占用走线通道
 jobs = [j for j in jobs if j[1] != gnd_id]
 
+# 展开成"边"级别的列表, 便于按单条连接重排优先级(整网重排会过度挤占通道)
+pairs = []
+for _tot, _netid, _edges in jobs:
+    for _i, _j in _edges:
+        pairs.append((_netid, _i, _j))
+
+# ---------- 手工走线: 显式指定折点, 相邻折点间用 A* 自动找合法路径 ----------
+# 每条 = (网络名, [(x, y, layer), ...]); layer: 0=F.Cu, 1=B.Cu
+# 第一个/最后一个点必须落在源/目标焊盘上; 中间折点取自由空间格, A* 负责绕障
+MANUAL_ROUTES = [
+    # --- MISO: 先走线，对角到 (105.5,126) 过孔 B.Cu，右行到 U1 ---
+    ("SPI_MISO", [(106.8, 123.5, 0), (105.5, 126.0, 0),
+                  (105.5, 126.0, 1), (121.0, 126.0, 1), (121.0, 129.675, 1),
+                  (121.0, 129.675, 0)]),
+    # --- IMU_REGOUT: F.Cu 下行到 (102.725,125), 过孔 B.Cu, B.Cu 右行+上行, 过孔回 F.Cu 到 pad10 ---
+    ("IMU_REGOUT", [(102.725, 117.0, 0), (102.725, 125.0, 0), (102.725, 125.0, 1),
+                    (107.2, 125.0, 1), (107.2, 123.5, 1), (107.2, 123.5, 0)]),
+    # --- +3V3: F.Cu 下行到 y=124.2 左行到 x=104.5 过孔, B.Cu 到 C11 ---
+    ("+3V3",     [(106.4, 123.5, 0), (106.4, 124.2, 0), (104.5, 124.2, 0),
+                  (104.5, 124.2, 1), (104.5, 127.0, 1), (105.225, 127.0, 1),
+                  (105.225, 127.0, 0)]),
+    # --- MOSI: 向左逃逸到 x=105, 过孔 B.Cu 走 y=118 走廊, x=121.5 过孔 F.Cu 下行到 U1 ---
+    ("SPI_MOSI", [(106.0, 120.5, 0), (105.0, 120.5, 0), (105.0, 118.0, 0),
+                  (105.0, 118.0, 1), (121.5, 118.0, 1), (121.5, 118.0, 0),
+                  (121.5, 129.675, 0)]),
+    # --- CS: 陡对角到 (107.5,119.2) 过孔 B.Cu, B.Cu 上行到 y=116.5 右行到 U1 pad3 ---
+    ("IMU_CS",   [(106.8, 120.5, 0), (107.5, 119.2, 0), (107.5, 119.2, 1),
+                  (107.5, 116.5, 1), (117.325, 116.5, 1), (117.325, 117.0, 1),
+                  (117.325, 117.0, 0)]),
+    # --- SCK: 直上到 y=119.5 就近过孔, B.Cu 左行到 x=103 下行到底部走廊到 U1 ---
+    ("SPI_SCK",  [(106.4, 120.5, 0), (106.4, 119.5, 0), (106.4, 119.5, 1),
+                  (103.0, 119.5, 1), (103.0, 129.0, 1), (120.5, 129.0, 1),
+                  (120.5, 129.0, 0), (120.5, 129.675, 0)]),
+    # --- nRST: U1 pad14 -> R3 (走 y=122 避开 SPI) ---
+    ("nRST",     [(117.325, 122.5, 0), (113.825, 122.0, 0), (113.825, 120.0, 0)]),
+    # --- nRST: R3 -> C7 (下到 y=119 打过孔, B.Cu 下行到 y=117 左行到 C7) ---
+    ("nRST",     [(113.825, 120.0, 0), (113.825, 119.0, 0), (113.825, 119.0, 1),
+                  (113.825, 117.0, 1), (106.725, 117.0, 1), (106.725, 117.0, 0)]),
+    # --- MOT 三条: U1 右边缘焊盘 -> 芯片内部过孔 -> B.Cu -> J4 ---
+    ("MOT_RR", [(132.675, 124.0, 0), (127.0, 124.0, 0), (127.0, 124.0, 1),
+                (127.0, 105.08, 1), (140.0, 105.08, 1)]),
+    ("MOT_FR", [(132.675, 123.5, 0), (131.0, 123.5, 0), (131.0, 123.5, 1),
+                (131.0, 107.62, 1), (140.0, 107.62, 1)]),
+    ("MOT_FL", [(132.675, 123.0, 0), (135.0, 123.0, 0), (135.0, 123.0, 1),
+                (135.0, 110.16, 1), (140.0, 110.16, 1)]),
+    # --- SWDIO: U1 pad71 -> J3 pin1 (右侧 y=118 水平直线) ---
+    ("SWDIO", [(132.675, 118.0, 0), (146.0, 118.0, 0)]),
+    # --- OSC_IN: U1 pad12 -> C8 pad1 (绕 U1 顶部 y=113.5, 左行到 x=115 避开 LED_STAT) ---
+    ("OSC_IN", [(117.325, 121.5, 0), (115.0, 121.5, 0), (115.0, 113.5, 0),
+                (135.225, 113.5, 0), (135.225, 114.0, 0)]),
+    # --- OSC_OUT: U1 pad13 -> C9 pad1 (绕 U1 底部 y=130) ---
+    ("OSC_OUT", [(117.325, 122.0, 0), (116.0, 122.0, 0), (116.0, 130.0, 0),
+                 (134.725, 130.0, 0), (134.725, 124.0, 0)]),
+    # --- VBAT_ADC: U1 pad22 -> R2 pad1 (左行到 x=116 绕 U1 底部) ---
+    ("VBAT_ADC", [(117.325, 126.5, 0), (116.0, 126.5, 0), (116.0, 134.0, 0),
+                  (139.175, 134.0, 0)]),
+    # --- LED_STAT: U1 pad7 -> D1 (走 y=106 绕开 U2 tab 与 R4) ---
+    ("LED_STAT", [(117.325, 119.0, 0), (116.0, 119.0, 0), (116.0, 106.0, 0),
+                  (144.0, 106.0, 0), (144.0, 110.7875, 0)]),
+    # --- VCAP1: U1 pad48 -> C5 (下行到 y=131 绕 U1 底部, 左行到 x=116, 上行到 y=112.5) ---
+    ("VCAP1",    [(130.0, 129.675, 0), (130.0, 131.0, 0), (116.0, 131.0, 0),
+                  (116.0, 112.5, 0), (124.725, 112.5, 0)]),
+]
+MANUAL = {}   # pair -> path (填充在 route_pair 定义之后)
+
 MOVES = [(1, 0, 1.0), (-1, 0, 1.0), (0, 1, 1.0), (0, -1, 1.0),
          (1, 1, 1.41421356), (1, -1, 1.41421356), (-1, 1, 1.41421356), (-1, -1, 1.41421356)]
 
@@ -469,7 +534,7 @@ def astar(net, start, goals, gx, gy):
                 cur = par[cur]
             return path[::-1]
         n_exp += 1
-        if n_exp > 900000:
+        if n_exp > 3000000:
             return None
         ix, iy, L = cur
         buf = cu[L]
@@ -553,61 +618,195 @@ def path_to_geo(net, path):
     if (start[0], start[1]) != (prev[0], prev[1]):
         emit_seg(net, start, prev, prev[2])
 
-def run_pass(order):
+def route_pair(pair):
+    """A* 布线单条连接, 返回路径(网格单元列表)或 None"""
+    netid, i, j = pair
+    pts = net_pads[netid]
+    ax, ay, aw, ah, atht = pts[i]
+    bx, by, bw, bh, btht = pts[j]
+    la = (0, 1) if atht else (0,)
+    lb = (0, 1) if btht else (0,)
+    goals = set()
+    # 目标只取焊盘铜箔内缩后的区域, 避免走线终点落在圆形/椭圆焊盘的空角上
+    gw = max(0.05, bw / 2.0 * 0.55)
+    gh = max(0.05, bh / 2.0 * 0.55)
+    for Lb in lb:
+        for ix, iy in rect_cells(bx, by, gw, gh):
+            goals.add((ix, iy, Lb))
+    if not goals:
+        cgx, cgy = cell_of(bx, by)
+        for Lb in lb:
+            goals.add((cgx, cgy, Lb))
+    gx, gy = cell_of(bx, by)
+    s = cell_of(ax, ay)
+    for La in la:
+        path = astar(netid, (s[0], s[1], La), goals, gx, gy)
+        if path:
+            return path
+    return None
+
+def rebuild(paths, seq):
+    """按给定顺序, 用 paths 中的走线重建占用网格与走线几何"""
     global cu, tracks
     cu = [bytearray(cu_base[0]), bytearray(cu_base[1])]
     tracks = []
-    routed = 0
-    failed = []
-    for tot, netid, edges in order:
-        pts = net_pads[netid]
-        for i, j in edges:
-            ax, ay, aw, ah, atht = pts[i]
-            bx, by, bw, bh, btht = pts[j]
-            la = (0, 1) if atht else (0,)
-            lb = (0, 1) if btht else (0,)
-            goals = set()
-            for Lb in lb:
-                for ix, iy in rect_cells(bx, by, bw / 2.0, bh / 2.0):
-                    goals.add((ix, iy, Lb))
-            gx, gy = cell_of(bx, by)
-            path = None
-            s = cell_of(ax, ay)
-            for La in la:
-                path = astar(netid, (s[0], s[1], La), goals, gx, gy)
-                if path:
-                    break
-            if path:
-                mark_route(netid, path)
-                path_to_geo(netid, path)
-                routed += 1
-            else:
-                failed.append((netid, (ax, ay), (bx, by)))
-    return routed, failed
+    # 手工走线优先固定
+    for _p, _path in MANUAL.items():
+        mark_route(_p[0], _path)
+        path_to_geo(_p[0], _path)
+    for p in seq:
+        path = paths.get(p)
+        if path:
+            mark_route(p[0], path)
+            path_to_geo(p[0], path)
 
-routed, failed = run_pass(jobs)
-best = (routed, list(failed), list(tracks), [bytearray(cu[0]), bytearray(cu[1])])
-if failed:
-    badnets = []
-    for netid, _a, _b in failed:
-        if netid not in badnets:
-            badnets.append(netid)
-    order2 = [j for j in jobs if j[1] in badnets] + [j for j in jobs if j[1] not in badnets]
-    r2, f2 = run_pass(order2)
-    print("pass2 (failed nets first): routed", r2, "failed", len(f2))
-    if len(f2) < len(failed):
-        best = (r2, list(f2), list(tracks), [bytearray(cu[0]), bytearray(cu[1])])
-routed, failed, tracks, cu = best
+def first_pass(seq):
+    global cu, tracks
+    cu = [bytearray(cu_base[0]), bytearray(cu_base[1])]
+    tracks = []
+    paths = dict(MANUAL)
+    for _p, _path in MANUAL.items():
+        mark_route(_p[0], _path)
+        path_to_geo(_p[0], _path)
+    failed = []
+    for p in seq:
+        path = route_pair(p)
+        if path:
+            paths[p] = path
+            mark_route(p[0], path)
+            path_to_geo(p[0], path)
+        else:
+            failed.append(p)
+    return paths, failed
+
+# ---- 计算手工走线路径 (此时 cu == cu_base, 在干净网格上逐段 A*) ----
+_manual_pairs = set()
+for _name, _wps in MANUAL_ROUTES:
+    _nid = NETIDX.get(_name)
+    if _nid is None:
+        print("MANUAL: unknown net", _name); continue
+    _sx, _sy = _wps[0][0], _wps[0][1]
+    _ex, _ey = _wps[-1][0], _wps[-1][1]
+    _pair = None
+    for _p in pairs:
+        if _p[0] != _nid:
+            continue
+        _a = net_pads[_nid][_p[1]]; _b = net_pads[_nid][_p[2]]
+        if ((abs(_a[0]-_sx)<0.6 and abs(_a[1]-_sy)<0.6 and abs(_b[0]-_ex)<0.6 and abs(_b[1]-_ey)<0.6) or
+            (abs(_b[0]-_sx)<0.6 and abs(_b[1]-_sy)<0.6 and abs(_a[0]-_ex)<0.6 and abs(_a[1]-_ey)<0.6)):
+            _pair = _p; break
+    if _pair is None:
+        print("MANUAL: no matching pair for", _name); continue
+    _full = []
+    _ok = True
+    for _k in range(len(_wps) - 1):
+        _ax, _ay, _al = _wps[_k]
+        _bx, _by, _bl = _wps[_k + 1]
+        _s = cell_of(_ax, _ay); _g = cell_of(_bx, _by)
+        _leg = astar(_nid, (_s[0], _s[1], _al), {(_g[0], _g[1], _bl)}, _g[0], _g[1])
+        if not _leg:
+            print("MANUAL leg fail: %s wp%d->%d (%.2f,%.2f,%d)->(%.2f,%.2f,%d)"
+                  % (_name, _k, _k+1, _ax,_ay,_al,_bx,_by,_bl))
+            _ok = False; break
+        _full.extend(_leg if not _full else _leg[1:])
+    if _ok:
+        MANUAL[_pair] = _full
+        _manual_pairs.add(_pair)
+        mark_route(_pair[0], _full)          # 立即占用, 后续手工线避让
+        print("MANUAL ok:", _name, "len", len(_full))
+pairs = [_p for _p in pairs if _p not in _manual_pairs]
+
+paths, failed = first_pass(pairs)
+print("first pass: routed", len(paths), "failed", len(failed))
+# ---- 全局重排: 把失败的连接提到最前面, 保留连通数最多的一轮 ----
+for _it in range(6):
+    if not failed:
+        break
+    badset = set(failed)
+    cand = first_pass(failed + [p for p in pairs if p not in badset])
+    print("  reorder round: routed", len(cand[0]), "failed", len(cand[1]))
+    if len(cand[0]) > len(paths):
+        paths, failed = cand
+
+# ---- 局部拆线重布: 只拆掉目标连接附近的既有走线, 给它腾出通道, 再把拆掉的线补回来 ----
+RIP_M = 25          # 拆线范围外扩 2.5 mm
+def path_bbox(path):
+    xs = [c[0] for c in path]; ys = [c[1] for c in path]
+    return min(xs), min(ys), max(xs), max(ys)
+
+def pair_bbox(pair):
+    pts = net_pads[pair[0]]
+    a = cell_of(pts[pair[1]][0], pts[pair[1]][1])
+    b = cell_of(pts[pair[2]][0], pts[pair[2]][1])
+    return min(a[0], b[0]) - RIP_M, min(a[1], b[1]) - RIP_M, max(a[0], b[0]) + RIP_M, max(a[1], b[1]) + RIP_M
+
+for _round in range(5):
+    n_fail = len([p for p in pairs if p not in paths])
+    if not n_fail:
+        break
+    progress = False
+    for pair in [p for p in pairs if p not in paths]:
+        bx0, by0, bx1, by1 = pair_bbox(pair)
+        victims = [q for q in paths
+                   if (lambda bb: bb[0] <= bx1 and bb[2] >= bx0 and bb[1] <= by1 and bb[3] >= by0)(path_bbox(paths[q]))]
+        if not victims:
+            continue
+        trial = dict(paths)
+        for q in victims:
+            del trial[q]
+        rebuild(trial, pairs)
+        p = route_pair(pair)
+        if not p:
+            rebuild(paths, pairs)
+            continue
+        trial[pair] = p
+        rebuild(trial, pairs)
+        lost = 0
+        for q in victims:
+            pq = route_pair(q)
+            if pq:
+                trial[q] = pq
+                mark_route(q[0], pq)
+                path_to_geo(q[0], pq)
+            else:
+                lost += 1
+        # 只要连通总数严格增加就接受(允许个别被拆的线改走别处失败)
+        if len(trial) > len(paths):
+            paths = trial
+            progress = True
+            print("  local reroute OK: net %d (ripped %d, lost %d)" % (pair[0], len(victims), lost))
+        else:
+            rebuild(paths, pairs)
+    if not progress:
+        break
+
+rebuild(paths, pairs)
+failed = [p for p in pairs if p not in paths]
+routed = len(paths)
 
 print("routed nets (pairs):", routed, "failed:", len(failed))
-for f in failed[:20]:
-    print("  FAIL net %d  %s -> %s" % f)
+for _netid, _i, _j in failed[:20]:
+    _a = net_pads[_netid][_i]; _b = net_pads[_netid][_j]
+    print("  FAIL net %d  %s -> %s" % (_netid, (_a[0], _a[1]), (_b[0], _b[1])))
+
+if os.environ.get("DBG"):
+    cu_saved = cu
+    cu = [bytearray(cu_base[0]), bytearray(cu_base[1])]
+    for _netid, _i, _j in failed:
+        _ax, _ay = net_pads[_netid][_i][0:2]
+        _bx, _by = net_pads[_netid][_j][0:2]
+        s = cell_of(_ax, _ay); g = cell_of(_bx, _by)
+        p = astar(_netid, (s[0], s[1], 0),
+                  {(g[0], g[1], 0), (g[0], g[1], 1)}, g[0], g[1])
+        print("  base-grid reachable:", bool(p), "net", _netid, (_ax, _ay), "->", (_bx, _by))
+    cu = cu_saved
 
 # ---- GND stitching vias: tie the F.Cu and B.Cu pours together ----
 n_stitch = 0
+stitch_pts = []
 if gnd_id > 0:
-    for gy in range(102, 149, 6):
-        for gx in range(102, 149, 6):
+    for gy in range(101, 149, 2):
+        for gx in range(104, 149, 2):
             ix, iy = cell_of(gx, gy)
             if ix < VIA_R or iy < VIA_R or ix >= NGRID - VIA_R or iy >= NGRID - VIA_R:
                 continue
@@ -622,10 +821,186 @@ if gnd_id > 0:
                         if cu[L][k] == 0:
                             cu[L][k] = gnd_id
             emit_via(gnd_id, ix, iy)
+            stitch_pts.append((ix, iy))
             n_stitch += 1
+    # explicit corner / edge stitching vias to tie edge GND islands
+    for _gx, _gy in [(104.0, 101.4), (148.6, 101.4), (104.0, 148.6), (148.6, 148.6),
+                     (125.0, 101.4), (148.6, 125.0), (125.0, 148.6),
+                     (112.0, 101.4), (138.0, 101.4), (104.0, 112.0), (104.0, 138.0),
+                     (148.6, 112.0), (148.6, 138.0), (112.0, 148.6), (138.0, 148.6)]:
+        ix, iy = cell_of(_gx, _gy)
+        if cu[0][iy * NGRID + ix] not in (0, gnd_id):
+            continue
+        if not via_ok(gnd_id, ix, iy):
+            continue
+        for L in (0, 1):
+            for yy in range(iy - VIA_R, iy + VIA_R + 1):
+                for xx in range(ix - VIA_R, ix + VIA_R + 1):
+                    k = yy * NGRID + xx
+                    if cu[L][k] == 0:
+                        cu[L][k] = gnd_id
+        emit_via(gnd_id, ix, iy)
+        stitch_pts.append((ix, iy))
+        n_stitch += 1
+    for _x, _y0, _y1 in [(106.0, 101.4, 106.0), (148.6, 101.4, 106.0),
+                         (106.0, 144.0, 148.6), (148.6, 144.0, 148.6)]:
+        ix0, iy0 = cell_of(_x, _y0)
+        ix1, iy1 = cell_of(_x, _y1)
+        for _iy in range(min(iy0, iy1), max(iy0, iy1) + 1):
+            for _xx in range(ix0 - ROUTE_R, ix0 + ROUTE_R + 1):
+                for L in (0, 1):
+                    if cu[L][_iy * NGRID + _xx] == 0:
+                        cu[L][_iy * NGRID + _xx] = gnd_id
+        emit_seg(gnd_id, (ix0, iy0, 0), (ix1, iy1, 0), 0)
+    # horizontal GND spine along top edge to tie top strip islands to main pour
+    for _y, segs in [(101.3, [(104.0, 108.0), (111.0, 138.5), (141.5, 148.5)]),
+                     (148.7, [(104.0, 148.5)])]:
+        iy = cell_of(_y, _y)[1]
+        for _x0, _x1 in segs:
+            ix0 = cell_of(_x0, _y)[0]
+            ix1 = cell_of(_x1, _y)[0]
+            for _xx in range(min(ix0, ix1), max(ix0, ix1) + 1):
+                for _yy in range(iy - ROUTE_R, iy + ROUTE_R + 1):
+                    for L in (0, 1):
+                        if cu[L][_yy * NGRID + _xx] == 0:
+                            cu[L][_yy * NGRID + _xx] = gnd_id
+            emit_seg(gnd_id, (ix0, iy, 0), (ix1, iy, 0), 0)
 print("GND stitching vias:", n_stitch)
 
+# tie each GND SMD pad to its nearest stitching via
+n_stub = 0
+if gnd_id > 0 and stitch_pts:
+    for netid, ax, ay, w, h, tht in pad_specs:
+        if netid != gnd_id or tht:
+            continue
+        s = cell_of(ax, ay)
+        cand = sorted(stitch_pts, key=lambda v: abs(v[0] - s[0]) + abs(v[1] - s[1]))[:30]
+        path = None
+        for vx, vy in cand:
+            if abs(vx - s[0]) + abs(vy - s[1]) > 120:
+                break
+            path = astar(gnd_id, (s[0], s[1], 0), {(vx, vy, 0)}, vx, vy)
+            if path:
+                break
+        if path:
+            mark_route(gnd_id, path)
+            path_to_geo(gnd_id, path)
+            n_stub += 1
+print("GND pad stubs:", n_stub)
 
+
+
+if os.environ.get("MAP"):
+    def dump_map(x0, y0, x1, y1, L=0, base=False):
+        buf = cu_base[L] if base else cu[L]
+        ix0, iy0 = cell_of(x0, y0); ix1, iy1 = cell_of(x1, y1)
+        print("== map L=%d %s x %.1f..%.1f y %.1f..%.1f ==" % (L, "base" if base else "routed", x0, x1, y0, y1))
+        print("      " + "".join(str((i // 10) % 10) for i in range(ix0, ix1 + 1)))
+        for iy in range(iy0, iy1 + 1):
+            row = []
+            for ix in range(ix0, ix1 + 1):
+                v = buf[iy * NGRID + ix]
+                if v == 0:
+                    row.append(".")
+                elif v == BLOCK:
+                    row.append("#")
+                else:
+                    row.append("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"[v % 62])
+            print("%5d %s" % (iy, "".join(row)))
+    for _L in (0, 1):
+        dump_map(131.0, 103.0, 142.0, 127.0, _L, True)
+    dump_map(131.0, 103.0, 142.0, 127.0, 0, False)
+    for _L in (0, 1):
+        dump_map(100.0, 114.0, 122.0, 130.0, _L, True)
+    dump_map(100.0, 114.0, 122.0, 130.0, 0, False)
+    _mr = os.environ.get("MAPXY")
+    if _mr:
+        _x0, _y0, _x1, _y1 = [float(v) for v in _mr.split(",")]
+        dump_map(_x0, _y0, _x1, _y1, 0, True)
+        dump_map(_x0, _y0, _x1, _y1, 0, False)
+
+# ---------- 3b. 后处理: 为 U1 的两个 GND 引脚让出 +3V3 通道, 并补 GND 过孔 ----------
+# 目的: 消除 3 处孤立 GND 铜岛 (U1.pad10 的 F.Cu 岛、U1.pad19 的细边、C10 的大岛)
+def _trk_net(s):
+    m = re.search(r'\(net (\d+)\)', s)
+    return int(m.group(1)) if m else -1
+
+def _trk_at(s):
+    m = re.search(r'\(at ([-\d.]+) ([-\d.]+)\)', s)
+    return (round(float(m.group(1)), 3), round(float(m.group(2)), 3)) if m else None
+
+def _trk_seg(s):
+    m = re.search(r'\(start ([-\d.]+) ([-\d.]+)\) \(end ([-\d.]+) ([-\d.]+)\)', s)
+    if not m:
+        return None
+    a = tuple(round(float(v), 3) for v in m.groups())
+    return (a, (a[2], a[3], a[0], a[1]))
+
+def drop_tracks(net_name, segs=(), vias=()):
+    """按 网络名 + 端点/坐标 删除 tracks 中的走线或过孔"""
+    nid = NETIDX[net_name]
+    segset = set()
+    for s in segs:
+        t = tuple(round(v, 3) for v in s)
+        segset.add(t)
+        segset.add((t[2], t[3], t[0], t[1]))
+    viaset = set(tuple(round(v, 3) for v in p) for p in vias)
+    kept = []
+    for t in tracks:
+        if _trk_net(t) != nid:
+            kept.append(t); continue
+        if '(via ' in t:
+            if _trk_at(t) in viaset:
+                continue
+        else:
+            sg = _trk_seg(t)
+            if sg and (sg[0] in segset or sg[1] in segset):
+                continue
+        kept.append(t)
+    tracks[:] = kept
+
+def add_seg(net_name, x0, y0, x1, y1, layer):
+    tracks.append('\t(segment (start %.3f %.3f) (end %.3f %.3f) (width %.2f) (layer "%s") (net %d) (uuid "%s"))'
+                  % (x0, y0, x1, y1, TRACK_W, layer, NETIDX[net_name], new_uuid()))
+
+def add_via(net_name, x, y):
+    tracks.append('\t(via (at %.3f %.3f) (size %.2f) (drill %.2f) (layers "F.Cu" "B.Cu") (net %d) (uuid "%s"))'
+                  % (x, y, VIA_DIA, VIA_DRILL, NETIDX[net_name], new_uuid()))
+
+# --- (1) 拆掉压住 U1.pad19(GND, y=125.0) 的 +3V3 走线/过孔 ---
+drop_tracks("+3V3",
+            segs=[(115.6, 124.5, 116.2, 125.1), (116.2, 125.1, 116.2, 125.4),
+                  (116.2, 125.4, 116.3, 125.5), (116.3, 125.5, 116.9, 125.5),
+                  (116.6, 126.0, 115.6, 125.0), (117.3, 126.0, 116.6, 126.0),
+                  (115.6, 125.0, 119.5, 125.0), (119.1, 121.0, 115.6, 124.5)],
+            vias=[(115.6, 124.5), (115.6, 125.0)])
+
+# --- (2) 重新接好 +3V3: 单个西侧过孔(115.6,125.4), 东侧仍经 (119.5,125.0) ---
+add_via("+3V3", 115.6, 125.4)
+add_seg("+3V3", 117.325, 125.5, 115.6, 125.5, "F.Cu")   # pad20 -> 过孔上方
+add_seg("+3V3", 115.6, 125.5, 115.6, 125.4, "F.Cu")
+add_seg("+3V3", 117.325, 126.0, 115.6, 126.0, "F.Cu")   # pad21 -> 西侧
+add_seg("+3V3", 115.6, 126.0, 115.6, 125.4, "F.Cu")
+add_seg("+3V3", 115.6, 125.4, 119.5, 125.0, "B.Cu")     # 连到东侧过孔
+add_seg("+3V3", 119.1, 121.0, 119.5, 125.0, "B.Cu")     # 连回上方 +3V3 簇
+
+# --- (2b) +3V3 斜线东移 0.2mm, 给 U1.pad10 的 GND 走线让出通道 ---
+drop_tracks("+3V3", segs=[(118.3, 121.0, 119.3, 120.0), (119.3, 120.0, 119.3, 118.2)])
+add_seg("+3V3", 118.5, 121.0, 119.3, 120.2, "F.Cu")
+add_seg("+3V3", 119.3, 120.2, 119.3, 118.2, "F.Cu")
+
+# --- (3) GND: U1.pad19 -> 过孔(116.0,124.4) ---
+add_via("GND", 116.0, 124.4)
+add_seg("GND", 117.325, 125.0, 116.0, 125.0, "F.Cu")
+add_seg("GND", 116.0, 125.0, 116.0, 124.4, "F.Cu")
+
+# --- (4) GND: U1.pad10 -> 过孔(118.7,119.8) ---
+add_via("GND", 118.7, 119.8)
+add_seg("GND", 117.325, 120.5, 118.3, 120.5, "F.Cu")
+add_seg("GND", 118.3, 120.5, 118.7, 119.8, "F.Cu")
+
+# --- (5) GND: C10 pad2 所在孤岛内补过孔 ---
+add_via("GND", 104.45, 121.1)
 
 # ---------- 4. assemble pcb ----------
 header = """(kicad_pcb
@@ -691,11 +1066,11 @@ zones = ""
 for layer in ("F.Cu", "B.Cu"):
     zones += """	(zone (net %d) (net_name "GND") (layer "%s") (uuid "%s")
 		(hatch edge 0.508)
-		(connect_pads yes (clearance 0.25))
-		(min_thickness 0.2)
+		(connect_pads yes (clearance 0.2))
+		(min_thickness 0.1)
 		(filled_areas_thickness no)
-		(fill yes (thermal_gap 0.3) (thermal_bridge_width 0.3))
-		(polygon (pts (xy 100.5 100.5) (xy 149.5 100.5) (xy 149.5 149.5) (xy 100.5 149.5)))
+		(fill yes (thermal_gap 0.3) (thermal_bridge_width 0.3) (island_removal_mode 0))
+		(polygon (pts (xy 102.2 101.0) (xy 149.0 101.0) (xy 149.0 149.0) (xy 102.2 149.0)))
 	)
 """ % (gnd, layer, new_uuid())
 
